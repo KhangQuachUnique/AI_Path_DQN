@@ -1,5 +1,26 @@
 import torch
 
+from torch_geometric.nn import GCNConv
+
+device = "cuda"
+
+class GNN(torch.nn.Module):
+    def __init__(self, in_features, hidden_dim, out_features):
+        super(GNN, self).__init__()
+        self.conv1 = GCNConv(in_features, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, out_features)
+
+    def forward(self, x, edge_index):
+        x = self.conv1(x, edge_index)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        return(x)
+
+# Load model GNN
+gnn = GNN(in_features=3, hidden_dim=16, out_features=3).to(device)
+gnn.load_state_dict(torch.load("gnn_model_Q1.pth"))  # Load trọng số đã train
+gnn.eval()
+
 graph_data = torch.load("graph_data_Q1.pth", weights_only=False)
 nodes = graph_data["nodes"]
 edges = graph_data["edges"]
@@ -20,6 +41,17 @@ class Environment:
                 self.adj_list[u].append((v, length))
                 self.adj_list[v].append((u, length))
 
+        edge_list = [(self.node_map[edge["u"]], self.node_map[edge["v"]]) for edge in edges if edge["u"] in self.node_map and edge["v"] in self.node_map]
+        edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous().to(device)
+        self.edge_index = edge_index
+
+        node_features = torch.stack([torch.tensor([self.nodes[n]['lat'], self.nodes[n]['lon'], self.nodes[n]['street_count']]) for n in self.node_list]).to(device)
+        self.node_features = node_features
+
+        with torch.no_grad():
+            node_embeddings = gnn(node_features, edge_index).to(device)
+            self.node_embeddings = node_embeddings
+
         self.start = None
         self.goal = None
         self.current = None
@@ -27,31 +59,44 @@ class Environment:
 
     def reset(self):
         self.start, self.goal = np.random.choice(self.node_list, 2, replace=False)
-        self.current = self.start
+        self.current = self.node_map[self.start]  # Map start node to its index
+        self.goal = self.node_map[self.goal]      # Map goal node to its index
         return self.get_state()
 
     def get_state(self):
-        start_data = self.nodes[self.current]
-        goal_data = self.nodes[self.goal]
-        return np.array([
-            start_data["lat"], start_data["lon"], start_data["street_count"],
-            goal_data["lat"], goal_data["lon"], goal_data["street_count"]
-        ], dtype=np.float32)
+        start_embedding = self.node_embeddings[self.current].cpu().numpy()
+        goal_embedding = self.node_embeddings[self.goal].cpu().numpy()
+        return np.concatenate((start_embedding, goal_embedding), axis=0).astype(np.float32)
 
     def step(self, action):
-        neighbors = self.adj_list[self.current]
+        neighbors = self.adj_list[self.node_list[self.current]]
         if action >= len(neighbors):
             return self.get_state(), -10, False
 
-        next_node, dist = neighbors[action]
-        reward = -dist
-        self.current = next_node
+        next_node, _ = neighbors[action]
+        if next_node not in self.node_map:
+            return self.get_state(), -10, False  # Invalid action
 
+        # Calculate distances
+        current_distance = np.linalg.norm(
+            np.array([self.nodes[self.node_list[self.current]]["lat"], self.nodes[self.node_list[self.current]]["lon"]]) -
+            np.array([self.nodes[self.node_list[self.goal]]["lat"], self.nodes[self.node_list[self.goal]]["lon"]])
+        )
+        next_distance = np.linalg.norm(
+            np.array([self.nodes[next_node]["lat"], self.nodes[next_node]["lon"]]) -
+            np.array([self.nodes[self.node_list[self.goal]]["lat"], self.nodes[self.node_list[self.goal]]["lon"]])
+        )
+
+        # Reward based on progress toward the goal
+        reward = current_distance - next_distance
+        self.current = self.node_map[next_node]
         done = (self.current == self.goal)
         if done:
-            reward += 100
+            reward += 100  # Large reward for reaching the goal
 
         return self.get_state(), reward, done
+
+
 
 import torch.nn as nn
 import torch.optim as optim
@@ -137,8 +182,11 @@ class DQNAgent:
 
 env = Environment(nodes, edges)
 agent = DQNAgent(input_dim=6, hidden_dim=128, output_dim=6)
+# agent.load_model("dqn_model_final.pth")
+# agent.epsilon = 1
 
 # episodes = 100000
+# reached_goal = 0
 # for episode in range(episodes):
 #     state = env.reset()
 #     total_reward = 0
@@ -150,20 +198,22 @@ agent = DQNAgent(input_dim=6, hidden_dim=128, output_dim=6)
 #         state = next_state
 #         total_reward += reward
 #         if done:
+#             reached_goal += 1
 #             break
 
-#     agent.train()
+#     agent.train() 
 #     agent.epsilon = max(agent.epsilon - agent.epsilon_decay, agent.epsilon_min)
 
 #     if episode % 100 == 0:
 #         agent.update_target_model()
-#         print(f"Episode {episode}, Reward: {total_reward}, Epsilon: {agent.epsilon}")
+#         print(f"Episode {episode}, Reward: {total_reward}, Epsilon: {agent.epsilon}, Reached goal: {reached_goal}")
 
 #     if episode % 10000 == 0:
 #         agent.save_model(f"dqn_model_{episode}.pth")
 
 # agent.save_model("dqn_model_final.pth")
 # print("✅ Training hoàn tất! Model đã được lưu.")
+
 
 
 agent.load_model("dqn_model_final.pth")  # Load mô hình đã train trước đó

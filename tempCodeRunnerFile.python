@@ -1,0 +1,2 @@
+current_node = self.node_list[self.current]  # Map index back to node name
+        neighbors = self.adj_list[current_node]
