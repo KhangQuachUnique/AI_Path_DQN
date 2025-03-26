@@ -1,0 +1,199 @@
+import torch
+
+graph_data = torch.load("graph_data_Q1.pth", weights_only=False)
+nodes = graph_data["nodes"]
+edges = graph_data["edges"]
+
+import numpy as np
+
+class Environment:
+    def __init__(self, nodes, edges):
+        self.nodes = nodes
+        self.edges = edges
+        self.node_list = list(nodes.keys())
+        self.node_map = {n: i for i, n in enumerate(self.node_list)}
+        self.adj_list = {node: [] for node in self.node_list}
+
+        for edge in edges:
+            u, v, length = edge["u"], edge["v"], edge["length"]
+            if u in self.adj_list and v in self.adj_list:
+                self.adj_list[u].append((v, length))
+                self.adj_list[v].append((u, length))
+
+        self.start = None
+        self.goal = None
+        self.current = None
+        self.visited = set()
+
+    def reset(self):
+        self.start, self.goal = np.random.choice(self.node_list, 2, replace=False)
+        self.current = self.start
+        return self.get_state()
+
+    def get_state(self):
+        start_data = self.nodes[self.current]
+        goal_data = self.nodes[self.goal]
+        return np.array([
+            start_data["lat"], start_data["lon"], start_data["street_count"],
+            goal_data["lat"], goal_data["lon"], goal_data["street_count"]
+        ], dtype=np.float32)
+
+    def step(self, action):
+        neighbors = self.adj_list[self.current]
+        if action >= len(neighbors):
+            return self.get_state(), -10, False
+
+        next_node, dist = neighbors[action]
+        reward = -dist
+        self.current = next_node
+
+        done = (self.current == self.goal)
+        if done:
+            reward += 100
+
+        return self.get_state(), reward, done
+
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+
+class QNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(QNN, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+import random
+from collections import deque
+
+class DQNAgent:
+    def __init__(self, input_dim, hidden_dim, output_dim, lr=0.001, gamma=0.95):
+        self.model = QNN(input_dim, hidden_dim, output_dim).to("cuda")
+        self.target_model = QNN(input_dim, hidden_dim, output_dim).to("cuda")
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.gamma = gamma
+        self.epsilon = 1.0
+        self.epsilon_min = 0.1
+        self.epsilon_decay = (self.epsilon - self.epsilon_min) / 50000
+        self.memory = deque(maxlen=10000)
+
+    def choose_action(self, state):
+        if random.random() < self.epsilon:
+            return random.randint(0, 5)
+        state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to("cuda")
+        return torch.argmax(self.model(state)).item()
+
+    def store_experience(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def train(self, batch_size=64):
+        if len(self.memory) < batch_size:
+            return
+
+        batch = random.sample(self.memory, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+
+        states = torch.tensor(states, dtype=torch.float32).to("cuda")
+        actions = torch.tensor(actions, dtype=torch.long).to("cuda")
+        rewards = torch.tensor(rewards, dtype=torch.float32).to("cuda")
+        next_states = torch.tensor(next_states, dtype=torch.float32).to("cuda")
+        dones = torch.tensor(dones, dtype=torch.float32).to("cuda")
+
+        q_values = self.model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        next_q_values = self.target_model(next_states).max(1)[0].detach()
+        target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+
+        loss = F.mse_loss(q_values, target_q_values)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
+
+    def save_model(self, path="dqn_model.pth"):
+        torch.save({
+            "model_state_dict": self.model.state_dict(),
+            "target_model_state_dict": self.target_model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "epsilon": self.epsilon
+        }, path)
+        print(f"✅ Model saved at {path}")
+
+    def load_model(self, path="dqn_model.pth"):
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.target_model.load_state_dict(checkpoint["target_model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.epsilon = checkpoint["epsilon"]
+        print(f"🔄 Model loaded from {path}")
+
+
+env = Environment(nodes, edges)
+agent = DQNAgent(input_dim=6, hidden_dim=128, output_dim=6)
+
+# episodes = 100000
+# for episode in range(episodes):
+#     state = env.reset()
+#     total_reward = 0
+
+#     for step in range(200):
+#         action = agent.choose_action(state)
+#         next_state, reward, done = env.step(action)
+#         agent.store_experience(state, action, reward, next_state, done)
+#         state = next_state
+#         total_reward += reward
+#         if done:
+#             break
+
+#     agent.train()
+#     agent.epsilon = max(agent.epsilon - agent.epsilon_decay, agent.epsilon_min)
+
+#     if episode % 100 == 0:
+#         agent.update_target_model()
+#         print(f"Episode {episode}, Reward: {total_reward}, Epsilon: {agent.epsilon}")
+
+#     if episode % 10000 == 0:
+#         agent.save_model(f"dqn_model_{episode}.pth")
+
+# agent.save_model("dqn_model_final.pth")
+# print("✅ Training hoàn tất! Model đã được lưu.")
+
+
+agent.load_model("dqn_model_final.pth")  # Load mô hình đã train trước đó
+
+state = env.reset()
+done = False
+path = [env.start]
+
+while not done:
+    action = agent.choose_action(state)
+    next_state, reward, done = env.step(action)
+    state = next_state
+    path.append(env.current)
+
+print("🎯 AI đã tìm được đường đi!")
+print("Lộ trình:", path)
+
+import folium
+
+def visualize_path(graph, path):
+    m = folium.Map(location=[10.775, 106.700], zoom_start=15)
+    coords = [(graph.nodes[n]['lat'], graph.nodes[n]['lon']) for n in path]
+    
+    for lat, lon in coords:
+        folium.CircleMarker(location=[lat, lon], radius=5, color='blue').add_to(m)
+    
+    folium.PolyLine(coords, color="red", weight=3).add_to(m)
+    
+    return m
+
+# Ví dụ gọi hàm
+m = visualize_path(graph_data, path)
+m.save("path_map.html")
